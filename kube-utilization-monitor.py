@@ -3,44 +3,37 @@ import argparse
 import dataclasses
 import datetime
 import time
+import typing
 
+import fastapi
+import pydantic
 import tabulate
 import termcolor
 import google.cloud.monitoring_v3
 
 
-async def main():
-    args = parse_args()
+class Settings(
+    pydantic.BaseSettings,
+):
+    project: str
+    namespaces: typing.List[str]
+    duration_days: int = 14
 
+
+settings = Settings()
+app = fastapi.FastAPI()
+
+@app.get('/utilization')
+async def get_utilization():
     utilization_monitor = UtilizationMonitor(
-        project=args.project,
-        namespaces=args.namespaces,
-        duration_days=args.duration_days,
+        project=settings.project,
+        namespaces=settings.namespaces,
+        duration_days=settings.duration_days,
     )
 
-    await utilization_monitor.print_utilization()
+    await utilization_monitor.query_metrics()
 
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        '--project',
-        required=True,
-    )
-
-    parser.add_argument(
-        '--namespaces',
-        nargs='+',
-    )
-
-    parser.add_argument(
-        '--duration-days',
-        type=int,
-        default=7,
-    )
-
-    return parser.parse_args()
+    return list(utilization_monitor.container_metrics.values())
 
 
 class UtilizationMonitor:
@@ -168,6 +161,15 @@ class UtilizationMonitor:
         for container_key, metrics in list(self.container_metrics.items()):
             if 'overprovisioner' in metrics.container_name:
                 del self.container_metrics[container_key]
+                continue
+
+            metrics.unutilized_memory = max(
+                0,
+                metrics.memory_request - metrics.max_memory_usage,
+            )
+
+            metrics.suggested_memory_request = int(metrics.max_memory_usage * 0.8)
+
 
     async def query(
         self,
@@ -332,16 +334,5 @@ class ContainerMetrics:
     avg_memory_usage: float = 0
     avg_memory_request_utilization: float = 0
     max_memory_usage: int = 0
-
-    @property
-    def unutilized_memory(
-        self,
-    ):
-        return max(
-            0,
-            self.memory_request - self.max_memory_usage,
-        )
-
-
-if __name__ == '__main__':
-    asyncio.run(main())
+    unutilized_memory: int = 0
+    suggested_memory_request: int = 0
