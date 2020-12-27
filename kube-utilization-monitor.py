@@ -2,6 +2,7 @@ import asyncio
 import argparse
 import dataclasses
 import datetime
+import enum
 import time
 import typing
 
@@ -16,27 +17,133 @@ class Settings(
     pydantic.BaseSettings,
 ):
     project: str
-    namespaces: typing.List[str]
-    duration_days: int = 14
+
+
+@dataclasses.dataclass
+class ContainerMetrics:
+    container_name: str
+    top_level_controller_name: str
+    namespace: str
+    memory_request: int = 0
+    avg_memory_usage: float = 0
+    avg_memory_request_utilization: float = 0
+    max_memory_usage: int = 0
+    unutilized_memory: int = 0
+    suggested_memory_request: int = 0
+
+
+class OutputFormat(
+    enum.Enum,
+):
+    table = 'table'
+    json = 'json'
 
 
 settings = Settings()
 app = fastapi.FastAPI()
 
-@app.get('/utilization')
-async def get_utilization():
-    utilization_monitor = UtilizationMonitor(
+
+@app.get('/memory_utilization')
+async def get_memory_utilization(
+    duration_days: int = 14,
+    namespaces: typing.List[str] = fastapi.Query(None),
+    output_format: OutputFormat = OutputFormat.table,
+):
+    metrics_client = MetricsClient(
         project=settings.project,
-        namespaces=settings.namespaces,
-        duration_days=settings.duration_days,
+        namespaces=namespaces,
+        duration_days=duration_days,
     )
 
-    await utilization_monitor.query_metrics()
+    metrics = await metrics_client.query_memory_utilization()
 
-    return list(utilization_monitor.container_metrics.values())
+    if output_format == OutputFormat.table:
+        table = format_metrics_as_table(
+            metrics=metrics,
+        ) + '\n'
+
+        return fastapi.Response(
+            content=table,
+        )
+    elif output_format == OutputFormat.json:
+        return metrics
 
 
-class UtilizationMonitor:
+def format_metrics_as_table(
+    metrics: typing.List[ContainerMetrics],
+):
+    metrics.sort(
+        key=lambda m: m.unutilized_memory,
+        reverse=True,
+    )
+    table = []
+
+    for metric in metrics:
+        avg_memory_request_utilization = percentage_gradient(
+            value=metric.avg_memory_request_utilization,
+        )
+
+        unutilized_memory = mb_gradient(
+            value=metric.unutilized_memory,
+        )
+
+        table.append(
+            [
+                metric.namespace,
+                f'{metric.top_level_controller_name}/{metric.container_name}',
+                f'{metric.memory_request / 1024 ** 2:.0f} MB',
+                f'{metric.avg_memory_usage / 1024 ** 2:.0f} MB',
+                f'{metric.max_memory_usage / 1024 ** 2:.0f} MB',
+                avg_memory_request_utilization,
+                unutilized_memory,
+            ],
+        )
+
+    total_avg_memory_request_utilization = percentage_gradient(
+        value=sum(
+            metric.avg_memory_request_utilization for metric in metrics
+        ) / len(metrics),
+    )
+
+    total_avg_memory_usage = sum(
+        metric.avg_memory_usage for metric in metrics
+    ) / len(metrics)
+
+    total_avg_memory_request = sum(
+        metric.memory_request for metric in metrics
+    )
+
+    total_unutilized_memory = sum(
+        metric.unutilized_memory for metric in metrics
+    )
+
+    table.append(
+        [
+            'Total',
+            '',
+            f'{total_avg_memory_request / 1024 ** 3:.0f} GB',
+            f'{total_avg_memory_usage / 1024 ** 2:.0f} MB',
+            '',
+            total_avg_memory_request_utilization,
+            f'{total_unutilized_memory / 1024 ** 3:.0f} GB',
+        ],
+    )
+
+    return tabulate.tabulate(
+        tabular_data=table,
+        headers=[
+            'Namespace',
+            'Deployment/Container',
+            'Mem Req',
+            'Avg Mem Usage',
+            'Max Mem Usage',
+            'Avg Mem Req Util',
+            'Unutilized Mem',
+        ],
+    )
+
+
+class MetricsClient:
     def __init__(
         self,
         project,
@@ -70,87 +177,9 @@ class UtilizationMonitor:
 
         self.container_metrics = {}
 
-    async def print_utilization(
+    async def query_memory_utilization(
         self,
-    ):
-        await self.query_metrics()
-
-        container_metrics = list(self.container_metrics.values())
-        container_metrics.sort(
-            key=lambda m: m.unutilized_memory,
-            reverse=True,
-        )
-        table = []
-
-        for metrics in container_metrics:
-            avg_memory_request_utilization = percentage_gradient(
-                value=metrics.avg_memory_request_utilization,
-            )
-
-            unutilized_memory = mb_gradient(
-                value=metrics.unutilized_memory,
-            )
-
-            table.append(
-                [
-                    metrics.namespace,
-                    f'{metrics.top_level_controller_name}/{metrics.container_name}',
-                    f'{metrics.memory_request / 1024 ** 2:.0f} MB',
-                    f'{metrics.avg_memory_usage / 1024 ** 2:.0f} MB',
-                    f'{metrics.max_memory_usage / 1024 ** 2:.0f} MB',
-                    avg_memory_request_utilization,
-                    unutilized_memory,
-                ],
-            )
-
-        total_avg_memory_request_utilization = percentage_gradient(
-            value=sum(
-                metrics.avg_memory_request_utilization for metrics in container_metrics
-            ) / len(container_metrics),
-        )
-
-        total_avg_memory_usage = sum(
-            metrics.avg_memory_usage for metrics in container_metrics
-        ) / len(container_metrics)
-
-        total_avg_memory_request = sum(
-            metrics.memory_request for metrics in container_metrics
-        )
-
-        total_unutilized_memory = sum(
-            metrics.unutilized_memory for metrics in container_metrics
-        )
-
-        table.append(
-            [
-                'Total',
-                '',
-                f'{total_avg_memory_request / 1024 ** 3:.0f} GB',
-                f'{total_avg_memory_usage / 1024 ** 2:.0f} MB',
-                '',
-                total_avg_memory_request_utilization,
-                f'{total_unutilized_memory / 1024 ** 3:.0f} GB',
-            ],
-        )
-
-        print(
-            tabulate.tabulate(
-                tabular_data=table,
-                headers=[
-                    'Namespace',
-                    'Deployment/Container',
-                    'Mem Req',
-                    'Avg Mem Usage',
-                    'Max Mem Usage',
-                    'Avg Mem Req Util',
-                    'Unutilized Mem',
-                ],
-            ),
-        )
-
-    async def query_metrics(
-        self,
-    ):
+    ) -> typing.List[ContainerMetrics]:
         await asyncio.gather(
             self.query_avg_memory_request_utilization(),
             self.query_max_memory_usage(),
@@ -170,6 +199,7 @@ class UtilizationMonitor:
 
             metrics.suggested_memory_request = int(metrics.max_memory_usage * 0.8)
 
+        return list(self.container_metrics.values())
 
     async def query(
         self,
@@ -292,6 +322,7 @@ class UtilizationMonitor:
 
             container.memory_request = metrics.points[0].value.int64_value
 
+
 def percentage_gradient(
     value,
 ):
@@ -324,15 +355,3 @@ def mb_gradient(
         text=f'{value_in_mb} MB',
         color=color,
     )
-
-@dataclasses.dataclass
-class ContainerMetrics:
-    container_name: str
-    top_level_controller_name: str
-    namespace: str
-    memory_request: int = 0
-    avg_memory_usage: float = 0
-    avg_memory_request_utilization: float = 0
-    max_memory_usage: int = 0
-    unutilized_memory: int = 0
-    suggested_memory_request: int = 0
