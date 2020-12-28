@@ -6,7 +6,7 @@ import pydantic
 import tabulate
 import termcolor
 
-from . import metrics_client
+from . import gcp_metrics_client
 
 
 class Settings(
@@ -41,7 +41,7 @@ async def get_metrics(
     namespaces: typing.List[str] = fastapi.Query(None),
     output_format: OutputFormat = OutputFormat.table,
 ):
-    client = metrics_client.MetricsClient(
+    client = gcp_metrics_client.MetricsClient(
         project=settings.project,
         namespaces=namespaces,
         duration_days=duration_days,
@@ -62,7 +62,7 @@ async def get_metrics(
 def format_metrics(
     metric_type: MetricType,
     output_format: OutputFormat,
-    metrics: typing.List[metrics_client.ContainerMetrics],
+    metrics: typing.List[gcp_metrics_client.ContainerMetrics],
 ):
     if output_format == OutputFormat.table:
         if metric_type == MetricType.memory:
@@ -81,7 +81,7 @@ def format_metrics(
 
 
 def format_memory_metrics_as_table(
-    metrics: typing.List[metrics_client.ContainerMetrics],
+    metrics: typing.List[gcp_metrics_client.ContainerMetrics],
 ):
     metrics.sort(
         key=lambda m: m.unutilized_memory,
@@ -155,7 +155,7 @@ def format_memory_metrics_as_table(
 
 
 def format_cpu_metrics_as_table(
-    metrics: typing.List[metrics_client.ContainerMetrics],
+    metrics: typing.List[gcp_metrics_client.ContainerMetrics],
 ):
     metrics.sort(
         key=lambda m: m.unutilized_cpu,
