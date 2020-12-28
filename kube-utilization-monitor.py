@@ -1,16 +1,12 @@
-import asyncio
-import argparse
-import dataclasses
-import datetime
 import enum
-import time
 import typing
 
 import fastapi
 import pydantic
 import tabulate
 import termcolor
-import google.cloud.monitoring_v3
+
+from . import metrics_client
 
 
 class Settings(
@@ -19,58 +15,73 @@ class Settings(
     project: str
 
 
-@dataclasses.dataclass
-class ContainerMetrics:
-    container_name: str
-    top_level_controller_name: str
-    namespace: str
-    memory_request: int = 0
-    avg_memory_usage: float = 0
-    avg_memory_request_utilization: float = 0
-    max_memory_usage: int = 0
-    unutilized_memory: int = 0
-    suggested_memory_request: int = 0
-
-
 class OutputFormat(
     enum.Enum,
 ):
     table = 'table'
     json = 'json'
+    csv = 'csv'
+
+
+class MetricType(
+    enum.Enum,
+):
+    memory = 'memory'
+    cpu = 'cpu'
 
 
 settings = Settings()
 app = fastapi.FastAPI()
 
 
-@app.get('/memory_utilization')
-async def get_memory_utilization(
+@app.get('/metrics/{metric_type}')
+async def get_metrics(
+    metric_type: MetricType,
     duration_days: int = 14,
     namespaces: typing.List[str] = fastapi.Query(None),
     output_format: OutputFormat = OutputFormat.table,
 ):
-    metrics_client = MetricsClient(
+    client = metrics_client.MetricsClient(
         project=settings.project,
         namespaces=namespaces,
         duration_days=duration_days,
     )
 
-    metrics = await metrics_client.query_memory_utilization()
+    if metric_type == MetricType.memory:
+        metrics = await client.query_memory_utilization()
+    elif metric_type == MetricType.cpu:
+        metrics = await client.query_cpu_utilization()
 
+    return format_metrics(
+        metric_type=metric_type,
+        output_format=output_format,
+        metrics=metrics,
+    )
+
+
+def format_metrics(
+    metric_type: MetricType,
+    output_format: OutputFormat,
+    metrics: typing.List[metrics_client.ContainerMetrics],
+):
     if output_format == OutputFormat.table:
-        table = format_metrics_as_table(
-            metrics=metrics,
-        ) + '\n'
-
+        if metric_type == MetricType.memory:
+            table = format_memory_metrics_as_table(
+                metrics=metrics,
+            )
+        elif metric_type == MetricType.cpu:
+            table = format_cpu_metrics_as_table(
+                metrics=metrics,
+            )
         return fastapi.Response(
-            content=table,
+            content=table + '\n',
         )
     elif output_format == OutputFormat.json:
         return metrics
 
 
-def format_metrics_as_table(
-    metrics: typing.List[ContainerMetrics],
+def format_memory_metrics_as_table(
+    metrics: typing.List[metrics_client.ContainerMetrics],
 ):
     metrics.sort(
         key=lambda m: m.unutilized_memory,
@@ -83,7 +94,7 @@ def format_metrics_as_table(
             value=metric.avg_memory_request_utilization,
         )
 
-        unutilized_memory = mb_gradient(
+        unutilized_memory = memory_bytes_gradient(
             value=metric.unutilized_memory,
         )
 
@@ -91,9 +102,9 @@ def format_metrics_as_table(
             [
                 metric.namespace,
                 f'{metric.top_level_controller_name}/{metric.container_name}',
-                f'{metric.memory_request / 1024 ** 2:.0f} MB',
-                f'{metric.avg_memory_usage / 1024 ** 2:.0f} MB',
-                f'{metric.max_memory_usage / 1024 ** 2:.0f} MB',
+                f'{metric.memory_request / 1024 ** 2:.0f}M',
+                f'{metric.avg_memory_usage / 1024 ** 2:.0f}M',
+                f'{metric.max_memory_usage / 1024 ** 2:.0f}M',
                 avg_memory_request_utilization,
                 unutilized_memory,
             ],
@@ -122,7 +133,7 @@ def format_metrics_as_table(
             'Total',
             '',
             f'{total_avg_memory_request / 1024 ** 3:.0f} GB',
-            f'{total_avg_memory_usage / 1024 ** 2:.0f} MB',
+            f'{total_avg_memory_usage / 1024 ** 2:.0f}M',
             '',
             total_avg_memory_request_utilization,
             f'{total_unutilized_memory / 1024 ** 3:.0f} GB',
@@ -134,193 +145,85 @@ def format_metrics_as_table(
         headers=[
             'Namespace',
             'Deployment/Container',
-            'Mem Req',
-            'Avg Mem Usage',
-            'Max Mem Usage',
-            'Avg Mem Req Util',
-            'Unutilized Mem',
+            'Request',
+            'Avg',
+            'Max',
+            'Avg Utilization',
+            'Unutilized',
         ],
     )
 
 
-class MetricsClient:
-    def __init__(
-        self,
-        project,
-        namespaces,
-        duration_days,
-    ):
-        self.metrics_client = google.cloud.monitoring_v3.services.metric_service.MetricServiceAsyncClient()
-        self.project = project
-        self.namespaces = namespaces
+def format_cpu_metrics_as_table(
+    metrics: typing.List[metrics_client.ContainerMetrics],
+):
+    metrics.sort(
+        key=lambda m: m.unutilized_cpu,
+        reverse=True,
+    )
+    table = []
 
-        now = time.time()
-        seconds = int(now)
-        nanos = int((now - seconds) * 10 ** 9)
-        self.duration = int(datetime.timedelta(days=duration_days).total_seconds())
-        self.interval = google.cloud.monitoring_v3.TimeInterval(
-            {
-                'end_time': {
-                    'seconds': seconds,
-                    'nanos': nanos,
-                },
-                'start_time': {
-                    'seconds': (seconds - self.duration),
-                    'nanos': nanos,
-                },
-            },
+    for metric in metrics:
+        avg_cpu_request_utilization = percentage_gradient(
+            value=metric.avg_cpu_request_utilization,
         )
 
-        self.request_semaphore = asyncio.Semaphore(
-            value=10,
+        unutilized_cpu = cpu_gradient(
+            value=metric.unutilized_cpu,
         )
 
-        self.container_metrics = {}
-
-    async def query_memory_utilization(
-        self,
-    ) -> typing.List[ContainerMetrics]:
-        await asyncio.gather(
-            self.query_avg_memory_request_utilization(),
-            self.query_max_memory_usage(),
-            self.query_avg_memory_usage(),
-            self.query_memory_request(),
+        table.append(
+            [
+                metric.namespace,
+                f'{metric.top_level_controller_name}/{metric.container_name}',
+                int(metric.cpu_request * 1000),
+                f'{int(metric.avg_cpu_usage * 1000)} ({avg_cpu_request_utilization})',
+                int(metric.max_cpu_usage * 1000),
+                unutilized_cpu,
+            ],
         )
 
-        for container_key, metrics in list(self.container_metrics.items()):
-            if 'overprovisioner' in metrics.container_name:
-                del self.container_metrics[container_key]
-                continue
+    total_avg_cpu_request_utilization = percentage_gradient(
+        value=sum(
+            metric.avg_cpu_request_utilization for metric in metrics
+        ) / len(metrics),
+    )
 
-            metrics.unutilized_memory = max(
-                0,
-                metrics.memory_request - metrics.max_memory_usage,
-            )
+    total_avg_cpu_usage = sum(
+        metric.avg_cpu_usage for metric in metrics
+    ) / len(metrics)
 
-            metrics.suggested_memory_request = int(metrics.max_memory_usage * 0.8)
+    total_avg_cpu_request = sum(
+        metric.cpu_request for metric in metrics
+    )
 
-        return list(self.container_metrics.values())
+    total_unutilized_cpu = sum(
+        metric.unutilized_cpu for metric in metrics
+    )
 
-    async def query(
-        self,
-        aligner,
-        reducer,
-        query_filter,
-    ):
-        if self.namespaces:
-            query_filter += ' AND (' + ' OR '.join(
-                f'resource.labels.namespace_name = "{namespace}"' for namespace in self.namespaces
-            ) + ')'
+    table.append(
+        [
+            'Total',
+            '',
+            int(total_avg_cpu_request * 1000),
+            int(total_avg_cpu_usage * 1000),
+            '',
+            # total_avg_cpu_request_utilization,
+            int(total_unutilized_cpu * 1000),
+        ],
+    )
 
-        aggregation = google.cloud.monitoring_v3.Aggregation(
-            {
-                'alignment_period': {
-                    'seconds': self.duration,
-                },
-                'per_series_aligner': aligner,
-                'cross_series_reducer': reducer,
-                'group_by_fields': [
-                    'resource.labels.namespace_name',
-                    'resource.container_name',
-                    'metadata.system_labels.top_level_controller_name'
-                ],
-            },
-        )
-
-        async with self.request_semaphore:
-            return await self.metrics_client.list_time_series(
-                request={
-                    'name': f'projects/{self.project}',
-                    'filter': query_filter,
-                    'interval': self.interval,
-                    'view': google.cloud.monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
-                    'aggregation': aggregation,
-                }
-            )
-
-    def upsert_container(
-        self,
-        metrics,
-    ):
-        container_key = (
-            metrics.resource.labels['namespace_name'],
-            metrics.resource.labels['container_name'],
-            metrics.metadata.system_labels['top_level_controller_name'],
-        )
-
-        container = self.container_metrics.get(container_key)
-        if not container:
-            self.container_metrics[container_key] = container = ContainerMetrics(
-                namespace=metrics.resource.labels['namespace_name'],
-                container_name=metrics.resource.labels['container_name'],
-                top_level_controller_name=metrics.metadata.system_labels['top_level_controller_name'],
-            )
-
-        return container
-
-    async def query_avg_memory_request_utilization(
-        self,
-    ):
-        results = await self.query(
-            aligner=google.cloud.monitoring_v3.Aggregation.Aligner.ALIGN_MEAN,
-            reducer=google.cloud.monitoring_v3.Aggregation.Reducer.REDUCE_MEAN,
-            query_filter=f'metric.type = "kubernetes.io/container/memory/request_utilization"',
-        )
-
-        async for metrics in results:
-            container = self.upsert_container(
-                metrics=metrics,
-            )
-
-            container.avg_memory_request_utilization = metrics.points[0].value.double_value
-
-    async def query_max_memory_usage(
-        self,
-    ):
-        results = await self.query(
-            aligner=google.cloud.monitoring_v3.Aggregation.Aligner.ALIGN_MAX,
-            reducer=google.cloud.monitoring_v3.Aggregation.Reducer.REDUCE_MAX,
-            query_filter=f'metric.type = "kubernetes.io/container/memory/used_bytes"',
-        )
-
-        async for metrics in results:
-            container = self.upsert_container(
-                metrics=metrics,
-            )
-
-            container.max_memory_usage = metrics.points[0].value.int64_value
-
-    async def query_avg_memory_usage(
-        self,
-    ):
-        results = await self.query(
-            aligner=google.cloud.monitoring_v3.Aggregation.Aligner.ALIGN_MEAN,
-            reducer=google.cloud.monitoring_v3.Aggregation.Reducer.REDUCE_MEAN,
-            query_filter=f'metric.type = "kubernetes.io/container/memory/used_bytes"',
-        )
-
-        async for metrics in results:
-            container = self.upsert_container(
-                metrics=metrics,
-            )
-
-            container.avg_memory_usage = metrics.points[0].value.double_value
-
-    async def query_memory_request(
-        self,
-    ):
-        results = await self.query(
-            aligner=google.cloud.monitoring_v3.Aggregation.Aligner.ALIGN_MAX,
-            reducer=google.cloud.monitoring_v3.Aggregation.Reducer.REDUCE_MAX,
-            query_filter=f'metric.type = "kubernetes.io/container/memory/request_bytes"',
-        )
-
-        async for metrics in results:
-            container = self.upsert_container(
-                metrics=metrics,
-            )
-
-            container.memory_request = metrics.points[0].value.int64_value
+    return tabulate.tabulate(
+        tabular_data=table,
+        headers=[
+            'Namespace',
+            'Deployment/Container',
+            'Request',
+            'Avg',
+            'Max',
+            'Unutilized',
+        ],
+    )
 
 
 def percentage_gradient(
@@ -339,7 +242,7 @@ def percentage_gradient(
     )
 
 
-def mb_gradient(
+def memory_bytes_gradient(
     value,
 ):
     value_in_mb = int(value / 1024 ** 2)
@@ -352,6 +255,24 @@ def mb_gradient(
         color = 'green'
 
     return termcolor.colored(
-        text=f'{value_in_mb} MB',
+        text=f'{value_in_mb}M',
+        color=color,
+    )
+
+
+def cpu_gradient(
+    value,
+):
+    value_in_milicores = int(value * 1000)
+
+    if value_in_milicores > 1000:
+        color = 'red'
+    elif value_in_milicores > 100:
+        color = 'yellow'
+    else:
+        color = 'green'
+
+    return termcolor.colored(
+        text=value_in_milicores,
         color=color,
     )
